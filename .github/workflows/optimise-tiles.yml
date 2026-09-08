@@ -1,16 +1,19 @@
-# One-off (re-runnable) optimisation of every map tile.
-# pngquant reduces each tile to a 256-colour palette (map tiles use few
-# colours, so this is visually lossless in practice), then oxipng
-# recompresses losslessly. Typical result is tiles at 40-60% of their
-# original size. Safe to re-run: already-optimised tiles are left alone
-# because pngquant skips any file it can't make smaller.
+# Optimise map tiles with pngquant, deduplicated: identical tiles (there
+# are huge numbers of identical ocean/black tiles) are optimised once and
+# the result copied to every twin. Optionally restricted to one zoom
+# level per run so each run stays well inside the job time limit.
+# Safe to re-run; already-optimised tiles are skipped.
 name: Optimise tiles
 
 on:
   workflow_dispatch:
     inputs:
+      zoom:
+        description: "Zoom level to process (e.g. 8). Blank = all"
+        required: false
+        default: ""
       quality:
-        description: "pngquant quality range (min-max). Lower min = smaller files, more risk of banding"
+        description: "pngquant quality range (min-max)"
         required: false
         default: "80-100"
 
@@ -24,7 +27,7 @@ concurrency:
 jobs:
   optimise:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
 
@@ -34,41 +37,70 @@ jobs:
           sudo apt-get install -y -q pngquant
           pngquant --version
 
-      - name: Install oxipng (optional)
-        continue-on-error: true
+      - name: Optimise (deduplicated)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ZOOM: ${{ github.event.inputs.zoom }}
+          QUALITY: ${{ github.event.inputs.quality }}
         run: |
-          # Authenticated API call so the runner's shared IP isn't rate-limited.
-          OXI_URL=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
-              https://api.github.com/repos/shssoichiro/oxipng/releases/latest \
-            | python3 -c "import sys,json; a=[x['browser_download_url'] for x in json.load(sys.stdin)['assets'] if 'x86_64-unknown-linux-musl' in x['name'] and x['name'].endswith('.tar.gz')]; print(a[0] if a else '')")
-          test -n "$OXI_URL"
-          curl -sSL "$OXI_URL" -o oxipng.tar.gz
-          tar -xzf oxipng.tar.gz
-          sudo mv oxipng-*/oxipng /usr/local/bin/oxipng
-          oxipng --version
+          python3 - <<'PY'
+          import hashlib, os, shutil, subprocess, sys, time
+          from concurrent.futures import ThreadPoolExecutor
 
-      - name: Size before
-        run: du -sh tiles | tee before.txt
+          zoom = os.environ.get("ZOOM", "").strip()
+          quality = os.environ.get("QUALITY", "80-100").strip() or "80-100"
+          root = "tiles"
 
-      - name: pngquant
-        run: |
-          find tiles -name '*.png' -print0 \
-            | xargs -0 -P "$(nproc)" -n 200 pngquant --ext .png --force --skip-if-larger \
-                --quality "${{ github.event.inputs.quality }}" --speed 3 || true
+          # tiles/<plane>/<z>/<x>/<y>.png
+          files = []
+          for plane in sorted(os.listdir(root)):
+              pdir = os.path.join(root, plane)
+              if not os.path.isdir(pdir): continue
+              for z in sorted(os.listdir(pdir)):
+                  if zoom and z != zoom: continue
+                  zdir = os.path.join(pdir, z)
+                  if not os.path.isdir(zdir): continue
+                  for x in os.listdir(zdir):
+                      xdir = os.path.join(zdir, x)
+                      if not os.path.isdir(xdir): continue
+                      for y in os.listdir(xdir):
+                          if y.endswith(".png"):
+                              files.append(os.path.join(xdir, y))
+          print(f"files: {len(files):,}", flush=True)
 
-      - name: oxipng
-        run: |
-          if ! command -v oxipng >/dev/null; then echo "oxipng not available, skipping"; exit 0; fi
-          find tiles -name '*.png' -print0 \
-            | xargs -0 -P "$(nproc)" -n 200 oxipng -o 4 --strip safe --quiet || true
+          t0 = time.time()
+          def digest(p):
+              h = hashlib.blake2b(digest_size=16)
+              with open(p, "rb") as f:
+                  h.update(f.read())
+              return h.hexdigest(), p
+          groups = {}
+          with ThreadPoolExecutor(max_workers=8) as ex:
+              for h, p in ex.map(digest, files, chunksize=2000):
+                  groups.setdefault(h, []).append(p)
+          before = sum(os.path.getsize(v[0]) * len(v) for v in groups.values())
+          print(f"unique images: {len(groups):,}  (hashed in {time.time()-t0:.0f}s)", flush=True)
 
-      - name: Size after
-        run: |
-          du -sh tiles | tee after.txt
-          echo "Before: $(cat before.txt)"
-          echo "After:  $(cat after.txt)"
+          reps = [v[0] for v in groups.values()]
+          def run_pngquant(batch):
+              subprocess.run(["pngquant", "--ext", ".png", "--force", "--skip-if-larger",
+                              "--quality", quality, "--speed", "3", *batch],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+          t0 = time.time()
+          batches = [reps[i:i + 200] for i in range(0, len(reps), 200)]
+          with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as ex:
+              list(ex.map(run_pngquant, batches))
+          print(f"pngquant done in {time.time()-t0:.0f}s", flush=True)
+
+          t0 = time.time()
+          copies = 0
+          for v in groups.values():
+              rep = v[0]
+              for twin in v[1:]:
+                  shutil.copyfile(rep, twin); copies += 1
+          after = sum(os.path.getsize(v[0]) * len(v) for v in groups.values())
+          print(f"copied to {copies:,} twins in {time.time()-t0:.0f}s", flush=True)
+          print(f"BEFORE {before/1e6:,.0f} MB   AFTER {after/1e6:,.0f} MB   ({100*after/max(1,before):.0f}%)")
+          PY
 
       - name: Commit
         run: |
@@ -78,6 +110,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes"
           else
-            git commit -m "Optimise tiles (pngquant + oxipng)"
+            git commit -q -m "Optimise tiles (pngquant)${{ github.event.inputs.zoom && format(' zoom {0}', github.event.inputs.zoom) || '' }}"
             git push
           fi
