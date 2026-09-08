@@ -28,17 +28,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Install pngquant
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q pngquant
-          # oxipng: grab the latest release binary
-          OXI_URL=$(curl -s https://api.github.com/repos/shssoichiro/oxipng/releases/latest \
-            | grep browser_download_url | grep x86_64-unknown-linux-musl.tar.gz | cut -d '"' -f 4 | head -1)
-          curl -sL "$OXI_URL" -o oxipng.tar.gz
+          pngquant --version
+
+      - name: Install oxipng (optional)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Authenticated API call so the runner's shared IP isn't rate-limited.
+          OXI_URL=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+              https://api.github.com/repos/shssoichiro/oxipng/releases/latest \
+            | python3 -c "import sys,json; a=[x['browser_download_url'] for x in json.load(sys.stdin)['assets'] if 'x86_64-unknown-linux-musl' in x['name'] and x['name'].endswith('.tar.gz')]; print(a[0] if a else '')")
+          test -n "$OXI_URL"
+          curl -sSL "$OXI_URL" -o oxipng.tar.gz
           tar -xzf oxipng.tar.gz
           sudo mv oxipng-*/oxipng /usr/local/bin/oxipng
-          pngquant --version && oxipng --version
+          oxipng --version
 
       - name: Size before
         run: du -sh tiles | tee before.txt
@@ -51,6 +60,7 @@ jobs:
 
       - name: oxipng
         run: |
+          if ! command -v oxipng >/dev/null; then echo "oxipng not available, skipping"; exit 0; fi
           find tiles -name '*.png' -print0 \
             | xargs -0 -P "$(nproc)" -n 200 oxipng -o 4 --strip safe --quiet || true
 
