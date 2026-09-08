@@ -1,0 +1,73 @@
+# One-off (re-runnable) optimisation of every map tile.
+# pngquant reduces each tile to a 256-colour palette (map tiles use few
+# colours, so this is visually lossless in practice), then oxipng
+# recompresses losslessly. Typical result is tiles at 40-60% of their
+# original size. Safe to re-run: already-optimised tiles are left alone
+# because pngquant skips any file it can't make smaller.
+name: Optimise tiles
+
+on:
+  workflow_dispatch:
+    inputs:
+      quality:
+        description: "pngquant quality range (min-max). Lower min = smaller files, more risk of banding"
+        required: false
+        default: "80-100"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: optimise-tiles
+  cancel-in-progress: false
+
+jobs:
+  optimise:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q pngquant
+          # oxipng: grab the latest release binary
+          OXI_URL=$(curl -s https://api.github.com/repos/shssoichiro/oxipng/releases/latest \
+            | grep browser_download_url | grep x86_64-unknown-linux-musl.tar.gz | cut -d '"' -f 4 | head -1)
+          curl -sL "$OXI_URL" -o oxipng.tar.gz
+          tar -xzf oxipng.tar.gz
+          sudo mv oxipng-*/oxipng /usr/local/bin/oxipng
+          pngquant --version && oxipng --version
+
+      - name: Size before
+        run: du -sh tiles | tee before.txt
+
+      - name: pngquant
+        run: |
+          find tiles -name '*.png' -print0 \
+            | xargs -0 -P "$(nproc)" -n 200 pngquant --ext .png --force --skip-if-larger \
+                --quality "${{ github.event.inputs.quality }}" --speed 3 || true
+
+      - name: oxipng
+        run: |
+          find tiles -name '*.png' -print0 \
+            | xargs -0 -P "$(nproc)" -n 200 oxipng -o 4 --strip safe --quiet || true
+
+      - name: Size after
+        run: |
+          du -sh tiles | tee after.txt
+          echo "Before: $(cat before.txt)"
+          echo "After:  $(cat after.txt)"
+
+      - name: Commit
+        run: |
+          git config user.name "optimise-tiles[bot]"
+          git config user.email "optimise-tiles@users.noreply.github.com"
+          git add -A tiles
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -m "Optimise tiles (pngquant + oxipng)"
+            git push
+          fi
