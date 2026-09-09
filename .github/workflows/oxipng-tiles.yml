@@ -1,0 +1,110 @@
+# Lossless recompression of every map tile with oxipng, deduplicated the
+# same way as the pngquant pass: identical tiles are recompressed once
+# and the result copied to every twin. Run after "Optimise tiles"; on
+# its own it is a smaller (5-10%) but zero-risk saving. Safe to re-run.
+name: Oxipng tiles
+
+on:
+  workflow_dispatch:
+    inputs:
+      zoom:
+        description: "Zoom level to process (e.g. 8). Blank = all"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: optimise-tiles
+  cancel-in-progress: false
+
+jobs:
+  oxipng:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install oxipng
+        run: |
+          # Try the Ubuntu package first; fall back to a pinned GitHub
+          # release binary (fixed URL, no API call to rate-limit).
+          if sudo apt-get install -y -q oxipng 2>/dev/null; then
+            echo "installed from apt"
+          else
+            VER=9.1.5
+            curl -fsSL "https://github.com/shssoichiro/oxipng/releases/download/v${VER}/oxipng-${VER}-x86_64-unknown-linux-musl.tar.gz" -o oxipng.tar.gz
+            tar -xzf oxipng.tar.gz
+            sudo mv oxipng-*/oxipng /usr/local/bin/oxipng
+          fi
+          oxipng --version
+
+      - name: Recompress (deduplicated)
+        env:
+          ZOOM: ${{ github.event.inputs.zoom }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, shutil, subprocess, time
+          from concurrent.futures import ThreadPoolExecutor
+
+          zoom = os.environ.get("ZOOM", "").strip()
+          root = "tiles"
+          files = []
+          for plane in sorted(os.listdir(root)):
+              pdir = os.path.join(root, plane)
+              if not os.path.isdir(pdir): continue
+              for z in sorted(os.listdir(pdir)):
+                  if zoom and z != zoom: continue
+                  zdir = os.path.join(pdir, z)
+                  if not os.path.isdir(zdir): continue
+                  for x in os.listdir(zdir):
+                      xdir = os.path.join(zdir, x)
+                      if not os.path.isdir(xdir): continue
+                      for y in os.listdir(xdir):
+                          if y.endswith(".png"):
+                              files.append(os.path.join(xdir, y))
+          print(f"files: {len(files):,}", flush=True)
+
+          t0 = time.time()
+          def digest(p):
+              h = hashlib.blake2b(digest_size=16)
+              with open(p, "rb") as f: h.update(f.read())
+              return h.hexdigest(), p
+          groups = {}
+          with ThreadPoolExecutor(max_workers=8) as ex:
+              for h, p in ex.map(digest, files, chunksize=2000):
+                  groups.setdefault(h, []).append(p)
+          before = sum(os.path.getsize(v[0]) * len(v) for v in groups.values())
+          print(f"unique images: {len(groups):,}  (hashed in {time.time()-t0:.0f}s)", flush=True)
+
+          reps = [v[0] for v in groups.values()]
+          def run_oxipng(batch):
+              subprocess.run(["oxipng", "-o", "4", "--strip", "safe", "--quiet", *batch],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+          t0 = time.time()
+          batches = [reps[i:i + 200] for i in range(0, len(reps), 200)]
+          with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as ex:
+              list(ex.map(run_oxipng, batches))
+          print(f"oxipng done in {time.time()-t0:.0f}s", flush=True)
+
+          t0 = time.time(); copies = 0
+          for v in groups.values():
+              for twin in v[1:]:
+                  shutil.copyfile(v[0], twin); copies += 1
+          after = sum(os.path.getsize(v[0]) * len(v) for v in groups.values())
+          print(f"copied to {copies:,} twins in {time.time()-t0:.0f}s", flush=True)
+          print(f"BEFORE {before/1e6:,.0f} MB   AFTER {after/1e6:,.0f} MB   ({100*after/max(1,before):.0f}%)")
+          PY
+
+      - name: Commit
+        run: |
+          git config user.name "optimise-tiles[bot]"
+          git config user.email "optimise-tiles@users.noreply.github.com"
+          git add -A tiles
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -q -m "Recompress tiles (oxipng)${{ github.event.inputs.zoom && format(' zoom {0}', github.event.inputs.zoom) || '' }}"
+            git push
+          fi
